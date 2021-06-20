@@ -1,2 +1,8 @@
 *.swp
-./rtl_fm ./rtl_sdr ./rtl_sdr_dump_data 
+rtl_fm 
+rtl_sdr 
+rtl_sdr_dump_data 
+*.o
+
+
+
