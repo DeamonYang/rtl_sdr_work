@@ -67,7 +67,7 @@
 #endif
 #define _USE_MATH_DEFINES
 #endif
-
+#include <fftw3.h>
 #include <math.h>
 #include <pthread.h>
 #include <libusb-1.0/libusb.h>
@@ -81,6 +81,7 @@
 #define MAXIMUM_BUF_LENGTH		(MAXIMUM_OVERSAMPLE * DEFAULT_BUF_LENGTH)
 #define AUTO_GAIN			-100
 #define BUFFER_DUMP			4096
+#define FFT_LEN             4096
 
 #define FREQUENCIES_LIMIT		1000
 
@@ -108,7 +109,20 @@ struct dongle_state
 	int      direct_sampling;
 	int      mute;
 	struct demod_state *demod_target;
+    struct iq_fft_state *iq_fft_target;
 };
+
+struct iq_fft_state
+{
+	pthread_t thread;
+	float fft_amp_result[FFT_LEN];
+    int16_t c16buff[MAXIMUM_BUF_LENGTH];
+    int data_len;
+	pthread_rwlock_t rw;
+	pthread_cond_t ready;
+	pthread_mutex_t ready_m;	
+};
+
 
 struct demod_state
 {
@@ -178,6 +192,7 @@ struct dongle_state dongle;
 struct demod_state demod;
 struct output_state output;
 struct controller_state controller;
+struct iq_fft_state iq_fft;
 
 void usage(void)
 {
@@ -783,6 +798,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	int i;
 	struct dongle_state *s = ctx;
 	struct demod_state *d = s->demod_target;
+    struct iq_fft_state *f = s->iq_fft_target;
 
 	if (do_exit) {
 		return;}
@@ -802,6 +818,13 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	d->lp_len = len;
 	pthread_rwlock_unlock(&d->rw);
 	safe_cond_signal(&d->ready, &d->ready_m);
+    
+    /*copy data to fft buffer*/
+    pthread_rwlock_wrlock(&f->rw);
+    memcpy(f->c16buff,s->buf16, 2*len);
+    f->data_len = len;
+	pthread_rwlock_unlock(&f->rw);
+	safe_cond_signal(&f->ready, &f->ready_m);    
 }
 
 static void *dongle_thread_fn(void *arg)
@@ -836,6 +859,65 @@ static void *demod_thread_fn(void *arg)
 	}
 	return 0;
 }
+
+
+#define PR_FFT_LEN (4096*20)
+#define FFT_BUFFER_GPR_NUM 100
+#define FFT_SIZE 4096
+static void *iq_fft_thread_fn(void *arg)
+{
+    struct iq_fft_state *f = arg;
+    static int data_tot_len_acc = 0;
+    int temp_data_len;
+    int update_fft_num = 0;
+    float fft_res_map[FFT_BUFFER_GPR_NUM][4096];
+    int i,j;
+    int16_t data_buff[3][4096];
+    fftw_complex in[FFT_LEN], out[FFT_LEN];
+    fftw_plan p;
+    float temp;
+    int base_idx = 0;
+    
+    while (!do_exit) {
+        safe_cond_wait(&f->ready, &f->ready_m);
+        pthread_rwlock_wrlock(&f->rw);
+        update_fft_num = f->data_len/PR_FFT_LEN;
+        if(update_fft_num > 0){
+            for(i = 0; i< update_fft_num; i++){
+                base_idx = i * PR_FFT_LEN;
+                memcpy(data_buff[i],&f->c16buff[i * PR_FFT_LEN],FFT_LEN*sizeof(int16_t));
+            }
+        }
+        pthread_rwlock_unlock(&f->rw);
+        
+        for(i = 0; i< update_fft_num; i++){
+            memcpy(data_buff[i],&f->c16buff[i * PR_FFT_LEN],FFT_LEN*sizeof(int16_t));
+            for(j = 0;j < FFT_LEN;j++){
+                in[j][0] = data_buff[i][j*2];
+                in[j][1] = data_buff[i][j*2 + 1];
+            }
+            
+            p = fftw_plan_dft_1d(FFT_LEN, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+            fftw_execute(p); /* repeat as needed */
+            
+            //update fft buffer
+            for(j = 0;j < FFT_BUFFER_GPR_NUM -1 ; j++){
+                memcpy(fft_res_map[FFT_BUFFER_GPR_NUM -2 -j],fft_res_map[FFT_BUFFER_GPR_NUM -1 -j], 4096*sizeof(float));
+            }
+            
+            for(j = 0;j < FFT_LEN;j ++){
+                temp = out[j][0]*out[j][0] + out[j][1]*out[j][1];
+                temp = sqrt(temp);
+                fft_res_map[0][j] = 20*log10(temp);
+            }
+            /******************waterfall & plot wave ***********************/
+             
+        } 
+    }
+}
+
+
+
 
 static void *output_thread_fn(void *arg)
 {
@@ -961,6 +1043,15 @@ void dongle_init(struct dongle_state *s)
 	s->direct_sampling = 0;
 	s->offset_tuning = 0;
 	s->demod_target = &demod;
+    s->iq_fft_target = &iq_fft;
+}
+
+
+
+
+void iq_fft_init(struct iq_fft_state *s)
+{
+    s->data_len = 0;
 }
 
 void demod_init(struct demod_state *s)
@@ -989,6 +1080,13 @@ void demod_init(struct demod_state *s)
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
 	s->output_target = &output;
+}
+
+void iq_fft_cleanup(struct iq_fft_state *s)
+{
+	pthread_rwlock_destroy(&s->rw);
+	pthread_cond_destroy(&s->ready);
+	pthread_mutex_destroy(&s->ready_m);
 }
 
 void demod_cleanup(struct demod_state *s)
@@ -1061,6 +1159,7 @@ int main(int argc, char **argv)
 	demod_init(&demod);
 	output_init(&output);
 	controller_init(&controller);
+    iq_fft_init(&iq_fft);
 
 	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:E:F:A:M:hT")) != -1) {
 		switch (opt) {
@@ -1252,6 +1351,7 @@ int main(int argc, char **argv)
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+    pthread_create(&iq_fft.thread, NULL, iq_fft_thread_fn, (void *)(&iq_fft));
 
 	while (!do_exit) {
 		usleep(100000);
@@ -1264,15 +1364,23 @@ int main(int argc, char **argv)
 
 	rtlsdr_cancel_async(dongle.dev);
 	pthread_join(dongle.thread, NULL);
+    
 	safe_cond_signal(&demod.ready, &demod.ready_m);
 	pthread_join(demod.thread, NULL);
+    
+    safe_cond_signal(&iq_fft.ready, &iq_fft.ready_m);
+    pthread_join(iq_fft.thread, NULL);
+    
 	safe_cond_signal(&output.ready, &output.ready_m);
 	pthread_join(output.thread, NULL);
+    
 	safe_cond_signal(&controller.hop, &controller.hop_m);
 	pthread_join(controller.thread, NULL);
+   
 
 	//dongle_cleanup(&dongle);
 	demod_cleanup(&demod);
+    iq_fft_cleanup(&iq_fft);
 	output_cleanup(&output);
 	controller_cleanup(&controller);
 
