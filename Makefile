@@ -12,7 +12,7 @@ rtl_sdr_dump_data:$(OBJ) rtl_sdr_dump_data.c
 rtl_fm:$(OBJ) rtl_fm.c
 	gcc -o $@ $^ $(CFLAGS)
 
-rtl_fm_fft:$(OBJ)  rtl_fm_fft.c
+rtl_fm_fft:$(OBJ)  rtl_fm_fft.c 
 	gcc -o $@ $^ $(CFLAGS)
 
 clean:
